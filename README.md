@@ -64,7 +64,7 @@ Both run automatically after `scanFirewall`:
 Pull the extension into your swamp workspace:
 
 ```bash
-swamp extension pull @shrug/unifi-networks --channel beta
+swamp extension pull @shrug/unifi-networks
 ```
 
 Create a model instance, passing `globalArguments` as repeatable `--global-arg

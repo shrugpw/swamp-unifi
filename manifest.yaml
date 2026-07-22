@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/unifi-networks"
-version: "2026.07.21.8"
+version: "2026.07.22.1"
 description: |-
   Query UniFi Network sites via the official integration API — VLANs, firewall
   zones/policies, connected clients, and WiFi SSIDs, all mapped together — with
@@ -11,7 +11,7 @@ description: |-
   name, and correct PRESET protocol rendering.
 
   Install & run:
-    swamp extension pull @shrug/unifi-networks --channel beta
+    swamp extension pull @shrug/unifi-networks
     swamp model create @shrug/unifi-networks my-unifi \
       --global-arg mode=local --global-arg host=192.0.2.1 \
       --global-arg 'apiKey=${{ vault.get("unifi", "integration-key") }}'
