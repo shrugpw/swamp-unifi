@@ -629,3 +629,92 @@ Deno.test("apiRequest: Retry-After header value is honored over default backoff"
   assertEquals(result, { ok: true });
   assertEquals(elapsedMs < 400, true); // well under the 500ms base backoff
 });
+
+// ── scan / consoles (model-level, via createModelTestContext + withMockedFetch) ──
+//
+// scanFirewall/scanWifi/scanClients share the identical target/site fan-out
+// shape as `scan` (see resolveTargets/fetchAllPages, already covered above),
+// so this exercises the common writeResource path once rather than
+// duplicating near-identical tests per method.
+//
+// scanUpdates is NOT covered end-to-end here: its login/checkUpdates/logout
+// steps are fetch-mockable, but the SYSTEM-message step depends on a raw
+// WebSocket, and @swamp-club/swamp-testing has no WebSocket mock primitive
+// (only withMockedFetch/withMockedCommand) — an accepted, documented gap
+// rather than a silently-skipped one.
+
+Deno.test("scan: writes one siteNetworks resource per site (local mode)", async () => {
+  const { context, getWrittenResources } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    if (url.pathname.endsWith("/v1/sites")) {
+      return Response.json({ data: [{ id: "s1", name: "Default" }] });
+    }
+    if (url.pathname.endsWith("/networks")) {
+      return Response.json({
+        data: [{
+          id: "n1",
+          name: "LAN",
+          management: "auto",
+          enabled: true,
+          vlanId: 1,
+          default: true,
+        }],
+      });
+    }
+    throw new Error(`unexpected request: ${req.method} ${req.url}`);
+  }, async () => {
+    return await model.methods.scan.execute({}, context);
+  });
+
+  assertEquals(result.dataHandles.length, 1);
+  const written = getWrittenResources();
+  assertEquals(written.length, 1);
+  assertEquals(written[0].specName, "siteNetworks");
+  assertEquals(written[0].name, "Default");
+  assertEquals(written[0].data.networkCount, 1);
+  assertEquals(
+    (written[0].data.networks as Array<{ name: string }>)[0].name,
+    "LAN",
+  );
+});
+
+Deno.test("consoles: requires cloud mode", async () => {
+  const { context } = testCtx({ mode: "local", apiKey: "key", verifyTls: true });
+  await assertRejects(
+    () => model.methods.consoles.execute({}, context),
+    Error,
+    "requires mode='cloud'",
+  );
+});
+
+Deno.test("consoles: writes discovered consoles in cloud mode", async () => {
+  const { context, getWrittenResources } = testCtx({
+    mode: "cloud",
+    apiKey: "key",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch(
+    () =>
+      Response.json({
+        data: [{
+          id: "console-1",
+          reportedState: {
+            hardware: { shortname: "UDMPRO", name: "My Console" },
+          },
+        }],
+      }),
+    async () => {
+      return await model.methods.consoles.execute({}, context);
+    },
+  );
+  assertEquals(result.dataHandles.length, 1);
+  const written = getWrittenResources();
+  assertEquals(written[0].specName, "consoles");
+  assertEquals(written[0].data.consoleCount, 1);
+});

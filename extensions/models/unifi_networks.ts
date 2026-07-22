@@ -865,14 +865,14 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.5",
+  version: "2026.07.21.6",
   globalArguments: GlobalArgsSchema,
   // No-op: globalArguments hasn't changed shape across any prior version —
   // every bump so far has been bug fixes/logging/docs, not schema changes.
   // Establishes the upgrades pattern for whenever a real migration is needed.
   upgrades: [
     {
-      toVersion: "2026.07.21.5",
+      toVersion: "2026.07.21.6",
       description: "Version bump, no globalArguments schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
@@ -1257,17 +1257,20 @@ export const model = {
           );
         }
 
-        // Step 3: Open websocket and listen for SYSTEM message
-        const wsUrl = `wss://${host}/api/ws/system`;
-        const ws = new WebSocket(wsUrl, {
-          headers: {
-            "Cookie": `TOKEN=${sessionCookie}`,
-            "x-csrf-token": csrfToken,
-          },
-        });
-
+        // Step 3: Open websocket and listen for SYSTEM message. The
+        // constructor call lives inside the try (not just the awaited
+        // promise) so a synchronous throw from `new WebSocket(...)` still
+        // reaches the finally below and attempts the session logout.
         let systemData: Record<string, unknown>;
         try {
+          const wsUrl = `wss://${host}/api/ws/system`;
+          const ws = new WebSocket(wsUrl, {
+            headers: {
+              "Cookie": `TOKEN=${sessionCookie}`,
+              "x-csrf-token": csrfToken,
+            },
+          });
+
           systemData = await new Promise<Record<string, unknown>>(
             (resolve, reject) => {
               const timeout = setTimeout(() => {
