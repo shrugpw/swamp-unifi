@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@shrug/unifi-networks"
-version: "2026.07.21.1"
-description: >-
+version: "2026.07.21.2"
+description: |-
   Query UniFi Network sites via the official integration API — VLANs, firewall
   zones/policies, connected clients, and WiFi SSIDs, all mapped together — with
   firewall-summary and zone-matrix reports. Local (per-console key) or cloud
@@ -9,6 +9,17 @@ description: >-
   update status via the management-plane websocket (scanUpdates). Vendored
   from @dmc/unifi-networks (MIT, Dan McClain) with fixes: optional policy
   name, and correct PRESET protocol rendering.
+
+  Install & run:
+    swamp extension pull @shrug/unifi-networks --channel beta
+    swamp model create @shrug/unifi-networks my-unifi \
+      --global-arg mode=local --global-arg host=192.0.2.1 \
+      --global-arg 'apiKey=${{ vault.get("unifi", "integration-key") }}'
+    swamp model method run my-unifi scan
+    swamp model method run my-unifi scanFirewall   # renders both reports
+
+  See README.md for the full method list, scanUpdates setup, and reading
+  results back via the data model.
 
 repository: https://github.com/shrugpw/swamp-unifi
 

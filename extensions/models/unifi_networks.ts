@@ -775,7 +775,7 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.1",
+  version: "2026.07.21.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     consoles: {
