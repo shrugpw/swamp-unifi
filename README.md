@@ -61,19 +61,47 @@ Both run automatically after `scanFirewall`:
 - In `local` mode the API key is passed to `curl` via a `-H` argument, so it is
   visible in the host process list for the duration of the call.
 
-## Example
+## Install & Usage
 
-```yaml
-# model instance globalArguments
-mode: local
-host: 192.168.1.1
-verifyTls: false
-apiKey: ${{ vault.get("unifi", "integration-key") }}
-```
+Pull the extension into your swamp workspace:
 
 ```bash
-swamp model method run my-unifi scan
-swamp model method run my-unifi scanFirewall   # renders both reports
-swamp model method run my-unifi scanClients
-swamp model method run my-unifi scanWifi
+swamp extension pull @shrug/unifi-networks --channel beta
 ```
+
+Create a model instance, passing `globalArguments` as repeatable `--global-arg
+key=value` flags:
+
+```bash
+swamp model create @shrug/unifi-networks my-unifi \
+  --global-arg mode=local \
+  --global-arg host=192.0.2.1 \
+  --global-arg 'apiKey=${{ vault.get("unifi", "integration-key") }}' \
+  --global-arg verifyTls=true
+```
+
+For `scanUpdates`, also pass the UniFi OS local admin credentials:
+
+```bash
+  --global-arg 'username=${{ vault.get("udm", "username") }}' \
+  --global-arg 'password=${{ vault.get("udm", "password") }}'
+```
+
+Run methods against the instance:
+
+```bash
+swamp model method run my-unifi scan          # networks/VLANs
+swamp model method run my-unifi scanFirewall  # firewall zones+policies, renders both reports
+swamp model method run my-unifi scanClients   # connected clients → VLAN
+swamp model method run my-unifi scanWifi      # SSIDs → VLAN
+swamp model method run my-unifi scanUpdates   # UDM OS + app update status
+```
+
+Read results back through the data model rather than re-running a method:
+
+```bash
+swamp data get my-unifi <resource-instance-name>
+```
+
+or from a workflow via CEL, e.g.
+`data.latest("my-unifi", "consoleUpdates").attributes.os.updateAvailable`.
