@@ -12,7 +12,7 @@ const GlobalArgsSchema = z.object({
     "UniFi API key matching the chosen mode",
   ),
   host: z.string().optional().describe(
-    "Console hostname or IP — required when mode='local' (e.g. 192.168.1.1)",
+    "Console hostname or IP — required when mode='local' (e.g. 192.0.2.1)",
   ),
   consoleId: z.string().optional().describe(
     "Cloud console ID to target. When mode='cloud' and omitted, all consoles " +
@@ -224,25 +224,24 @@ interface RequestOptions {
 /**
  * Build the curl argv for a request. `-k` skips TLS verification (self-signed
  * UDM cert); `-w "\n%{http_code}"` appends the status on its own trailing line
- * so the caller can recover it from stdout. A body adds the JSON content type.
- * Exported for testing.
+ * so the caller can recover it from stdout. `-K -` reads header config from
+ * stdin (see buildCurlConfig) instead of `-H`, so the API key never appears in
+ * argv/the host process list. A body adds the JSON content type. Exported for
+ * testing.
  */
 export function buildCurlArgs(
   method: string,
   url: string,
-  apiKey: string,
   body?: unknown,
 ): string[] {
   const args = [
     "-sk",
+    "-K",
+    "-",
     "-X",
     method,
     "--connect-timeout",
     "10",
-    "-H",
-    `X-API-KEY: ${apiKey}`,
-    "-H",
-    "Accept: application/json",
     "-w",
     "\n%{http_code}",
   ];
@@ -256,6 +255,24 @@ export function buildCurlArgs(
   }
   args.push(url);
   return args;
+}
+
+/**
+ * Build a curl config-file body (for `-K -` via stdin) carrying header
+ * values that must not appear in argv (visible to other local users via `ps`
+ * for the process's lifetime). Values are escaped for curl's config-file
+ * quoting (backslash and double-quote) — safe for typical API key/token
+ * content; a value containing other curl-config-significant characters is
+ * not specifically hardened against. Exported for testing.
+ */
+export function buildCurlConfig(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([k, v]) => `header = "${k}: ${escapeCurlConfigValue(v)}"`)
+    .join("\n") + "\n";
+}
+
+function escapeCurlConfigValue(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 /**
@@ -300,8 +317,11 @@ export function finalizeResponse(
 /**
  * Issue an HTTP request via curl. Factory UDMs present a self-signed cert and
  * Deno's fetch cannot skip TLS verification, so the insecure local path shells
- * out to curl with -k. Returns the HTTP status and raw body; status enforcement
- * is left to apiRequest so both transports behave identically.
+ * out to curl with -k. The API key and Accept header are passed via a `-K -`
+ * config piped over stdin rather than `-H` argv, so the key is never visible
+ * to other local users via `ps`/`/proc/<pid>/cmdline`. Returns the HTTP status
+ * and raw body; status enforcement is left to apiRequest so both transports
+ * behave identically.
  */
 async function curlRequest(
   method: string,
@@ -309,12 +329,21 @@ async function curlRequest(
   apiKey: string,
   body?: unknown,
 ): Promise<{ status: number; body: string }> {
+  const config = buildCurlConfig({
+    "X-API-KEY": apiKey,
+    "Accept": "application/json",
+  });
   const cmd = new Deno.Command("curl", {
-    args: buildCurlArgs(method, url, apiKey, body),
+    args: buildCurlArgs(method, url, body),
+    stdin: "piped",
     stdout: "piped",
     stderr: "piped",
   });
-  const out = await cmd.output();
+  const child = cmd.spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(config));
+  await writer.close();
+  const out = await child.output();
   if (out.code !== 0) {
     throw new Error(
       `curl ${method} ${url} failed (exit ${out.code}): ${
@@ -325,10 +354,23 @@ async function curlRequest(
   return parseCurlOutput(new TextDecoder().decode(out.stdout));
 }
 
+/** Requests time out after this many ms on the native fetch transport (curl uses --connect-timeout 10 instead). */
+const FETCH_TIMEOUT_MS = 15_000;
+
+/** How many extra attempts a 429/503 gets before apiRequest gives up. */
+const MAX_RETRIES = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Single request core shared by every verb (GET/POST/PUT/PATCH/DELETE) over
- * both transports (fetch when secure, curl when insecure). Verb helpers below
- * are thin wrappers over this.
+ * both transports (fetch when secure, curl when insecure). Retries on 429/503
+ * with exponential backoff, honoring a numeric `Retry-After` header (in
+ * seconds) from the fetch transport when present — curl's transport has no
+ * header visibility here, so it always falls back to backoff. Verb helpers
+ * below are thin wrappers over this.
  */
 async function apiRequest(
   method: string,
@@ -338,26 +380,40 @@ async function apiRequest(
 ): Promise<Record<string, unknown> | null> {
   const { insecure = false, body } = opts;
 
-  let status: number;
-  let text: string;
-  if (insecure) {
-    ({ status, body: text } = await curlRequest(method, url, apiKey, body));
-  } else {
-    const headers: Record<string, string> = {
-      "X-API-KEY": apiKey,
-      "Accept": "application/json",
-    };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
-    const resp = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-    status = resp.status;
-    text = await resp.text();
-  }
+  for (let attempt = 0;; attempt++) {
+    let status: number;
+    let text: string;
+    let retryAfterMs: number | undefined;
 
-  return finalizeResponse(method, url, status, text);
+    if (insecure) {
+      ({ status, body: text } = await curlRequest(method, url, apiKey, body));
+    } else {
+      const headers: Record<string, string> = {
+        "X-API-KEY": apiKey,
+        "Accept": "application/json",
+      };
+      if (body !== undefined) headers["Content-Type"] = "application/json";
+      const resp = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      status = resp.status;
+      text = await resp.text();
+      const retryAfter = resp.headers.get("retry-after");
+      if (retryAfter && /^\d+$/.test(retryAfter)) {
+        retryAfterMs = Number(retryAfter) * 1000;
+      }
+    }
+
+    if ((status === 429 || status === 503) && attempt < MAX_RETRIES) {
+      await sleep(retryAfterMs ?? 500 * 2 ** attempt);
+      continue;
+    }
+
+    return finalizeResponse(method, url, status, text);
+  }
 }
 
 // Verb helpers over the shared core. GET/DELETE are the verbs in use today;
@@ -369,7 +425,18 @@ const apiGet = (url: string, apiKey: string, insecure = false) =>
 const apiDelete = (url: string, apiKey: string, insecure: boolean) =>
   apiRequest("DELETE", url, apiKey, { insecure }).then(() => undefined);
 
-async function fetchAllPages(
+/**
+ * Page through a list endpoint until the last page. An empty or short
+ * (< limit) page is the sole authoritative "no more data" signal — this is
+ * what every offset/limit list endpoint here guarantees. `totalCount`, when
+ * present, is used ONLY as a redundant early-exit optimization, never as the
+ * primary stop condition: a naive `items.length >= (totalCount ?? 0)` check
+ * would silently truncate to a single page the moment any response omits
+ * `totalCount`, since `?? 0` makes that comparison trivially true. Guards
+ * against a stale/wrong totalCount too, since it can never fire before the
+ * short-page signal would have anyway.
+ */
+export async function fetchAllPages(
   base: string,
   path: string,
   apiKey: string,
@@ -386,12 +453,11 @@ async function fetchAllPages(
     );
     const data = (page.data ?? []) as Array<Record<string, unknown>>;
     items.push(...data);
-    // Stop on the last page, an empty page (guards against a stale totalCount
-    // that would otherwise loop forever), or a short page.
+    const totalCount = page.totalCount as number | undefined;
     if (
       data.length === 0 ||
       data.length < limit ||
-      items.length >= ((page.totalCount as number) ?? 0)
+      (totalCount !== undefined && items.length >= totalCount)
     ) break;
     offset += limit;
   }
@@ -430,7 +496,7 @@ function mapZone(z_: Record<string, unknown>): z.infer<typeof ZoneSchema> {
 type Obj = Record<string, unknown>;
 
 /** Readable protocol from an ipProtocolScope, e.g. "tcp", "icmp", "proto 47", "all". */
-function describeProtocol(scope: Obj | undefined): string | undefined {
+export function describeProtocol(scope: Obj | undefined): string | undefined {
   if (!scope) return undefined;
   const pf = scope.protocolFilter as Obj | undefined;
   if (!pf) return "all";
@@ -449,7 +515,7 @@ function describeProtocol(scope: Obj | undefined): string | undefined {
 }
 
 /** Readable port match, e.g. "22, 80, 8000-8080" or "not 443". */
-function describePorts(portFilter: Obj | undefined): string | undefined {
+export function describePorts(portFilter: Obj | undefined): string | undefined {
   if (!portFilter) return undefined;
   if (portFilter.type !== "PORTS") return "traffic-matching-list";
   const items = (portFilter.items as Obj[]) ?? [];
@@ -463,7 +529,7 @@ function describePorts(portFilter: Obj | undefined): string | undefined {
 }
 
 /** Readable source/destination traffic filter beyond the zone. */
-function describeTrafficFilter(
+export function describeTrafficFilter(
   filter: Obj | undefined,
   zoneNames: Record<string, string>,
 ): string | undefined {
@@ -694,7 +760,7 @@ export function mapSystemMessage(systemData: Record<string, unknown>): {
 }
 
 /** A console to scan: its proxy base URL plus identity for labelling output. */
-interface Target {
+export interface Target {
   base: string;
   target: string;
   consoleId?: string;
@@ -707,7 +773,7 @@ function proxyBase(consoleId: string): string {
 }
 
 /** Resolve the set of consoles to scan from the configured mode + args. */
-async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
+export async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
   if (g.mode === "local") {
     if (!g.host) {
       throw new Error("mode='local' requires 'host' (the console IP/hostname)");
@@ -730,9 +796,9 @@ async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
   }
 
   // cloud, no consoleId → discover and fan out over every console
-  const hostsData = await apiGet(`${CLOUD_BASE}/v1/hosts`, g.apiKey);
-  const consoles = ((hostsData.data ?? []) as Array<Record<string, unknown>>)
-    .map(mapConsole);
+  const consoles =
+    (await fetchAllPages(CLOUD_BASE, "/v1/hosts", g.apiKey, false))
+      .map(mapConsole);
   if (consoles.length === 0) {
     throw new Error("No consoles visible to this cloud API key");
   }
@@ -748,24 +814,39 @@ async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
 /**
  * Data instance name for a site. Uses the bare site name for single-target
  * scans so local and cloud modes converge on the same instance; only appends
- * the console identity as a suffix when fanning out over multiple consoles,
- * where it is needed to keep same-named sites from colliding. Suffix (not
- * prefix) so a site's instances sort together, e.g. "Default", "Default-UDMPRO".
+ * a console-identity suffix when fanning out over multiple consoles, where it
+ * is needed to keep same-named sites from colliding. The suffix always
+ * includes `consoleId` (the API's actual unique identifier) rather than
+ * `consoleShortname` alone — shortname is just a hardware model name (e.g.
+ * "UDMPRO") and repeats across consoles of the same model, which would
+ * otherwise let two same-named sites on two same-model consoles silently
+ * overwrite each other's stored resource. Suffix (not prefix) so a site's
+ * instances sort together, e.g. "Default", "Default-UDMPRO-<consoleId>".
  */
-function instanceName(
+export function instanceName(
   t: Target,
   siteName: string,
   disambiguate: boolean,
 ): string {
-  const suffix = disambiguate ? (t.consoleShortname ?? t.consoleId) : undefined;
+  const suffix = disambiguate
+    ? (t.consoleShortname
+      ? `${t.consoleShortname}-${t.consoleId}`
+      : t.consoleId)
+    : undefined;
   const raw = suffix ? `${siteName}-${suffix}` : siteName;
   return raw.replace(/[^A-Za-z0-9._-]/g, "-");
 }
 
 // ── model ─────────────────────────────────────────────────────────────────────
 
+interface Logger {
+  info: (message: string, properties?: Record<string, unknown>) => void;
+  warn: (message: string, properties?: Record<string, unknown>) => void;
+}
+
 interface Ctx {
   globalArgs: GlobalArgs;
+  logger: Logger;
   writeResource: (
     specName: string,
     name: string,
@@ -775,8 +856,18 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.2",
+  version: "2026.07.21.4",
   globalArguments: GlobalArgsSchema,
+  // No-op: globalArguments hasn't changed shape across any prior version —
+  // every bump so far has been bug fixes/logging/docs, not schema changes.
+  // Establishes the upgrades pattern for whenever a real migration is needed.
+  upgrades: [
+    {
+      toVersion: "2026.07.21.4",
+      description: "Version bump, no globalArguments schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     consoles: {
       description: "UniFi consoles visible to the cloud API key",
@@ -825,6 +916,9 @@ export const model = {
         "Use to find a consoleId to pin.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info(
+          "Discovering consoles visible to the cloud API key",
+        );
         const g = context.globalArgs;
         if (g.mode !== "cloud") {
           throw new Error(
@@ -832,15 +926,17 @@ export const model = {
               "is a cloud API feature)",
           );
         }
-        const hostsData = await apiGet(`${CLOUD_BASE}/v1/hosts`, g.apiKey);
-        const consoles = ((hostsData.data ?? []) as Array<
-          Record<string, unknown>
-        >).map(mapConsole);
+        const consoles =
+          (await fetchAllPages(CLOUD_BASE, "/v1/hosts", g.apiKey, false))
+            .map(mapConsole);
 
         const handle = await context.writeResource("consoles", "consoles", {
           fetchedAt: new Date().toISOString(),
           consoleCount: consoles.length,
           consoles,
+        });
+        context.logger.info("Found {count} console(s)", {
+          count: consoles.length,
         });
         return { dataHandles: [handle] };
       },
@@ -852,6 +948,9 @@ export const model = {
         "mode scans the given consoleId, or every visible console when omitted.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info("Scanning networks ({mode} mode)", {
+          mode: context.globalArgs.mode,
+        });
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
         const disambiguate = targets.length > 1;
@@ -894,6 +993,9 @@ export const model = {
           }
         }
 
+        context.logger.info("Wrote {count} site network snapshot(s)", {
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -904,6 +1006,12 @@ export const model = {
         "human-readable source/destination zone names. Same mode/fan-out rules as scan.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info(
+          "Scanning firewall zones and policies ({mode} mode)",
+          {
+            mode: context.globalArgs.mode,
+          },
+        );
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
         const disambiguate = targets.length > 1;
@@ -963,6 +1071,9 @@ export const model = {
           }
         }
 
+        context.logger.info("Wrote {count} site firewall snapshot(s)", {
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -974,6 +1085,9 @@ export const model = {
         "Same mode/fan-out rules as scan.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info("Scanning WiFi broadcasts ({mode} mode)", {
+          mode: context.globalArgs.mode,
+        });
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
         const disambiguate = targets.length > 1;
@@ -1041,6 +1155,9 @@ export const model = {
           }
         }
 
+        context.logger.info("Wrote {count} site WiFi snapshot(s)", {
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -1053,6 +1170,7 @@ export const model = {
         "then parses the SYSTEM message for OS and controller update data.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info("Scanning UDM OS/app update status");
         const g = context.globalArgs;
         if (g.mode !== "local") {
           throw new Error(
@@ -1082,6 +1200,7 @@ export const model = {
             "Accept": "application/json",
           },
           body: JSON.stringify({ username: g.username, password: g.password }),
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         });
         const loginText = await loginResp.text();
         if (loginResp.status < 200 || loginResp.status >= 300) {
@@ -1120,6 +1239,7 @@ export const model = {
               "innerspace",
             ],
           }),
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         });
         if (checkResp.status < 200 || checkResp.status >= 300) {
           throw new Error(
@@ -1139,13 +1259,10 @@ export const model = {
 
         const systemData = await new Promise<Record<string, unknown>>(
           (resolve, reject) => {
-            const timeout = setTimeout(
-              () =>
-                reject(
-                  new Error("WebSocket timeout waiting for SYSTEM message"),
-                ),
-              15000,
-            );
+            const timeout = setTimeout(() => {
+              ws.close();
+              reject(new Error("WebSocket timeout waiting for SYSTEM message"));
+            }, 15000);
 
             ws.onopen = () => {
               // Connection opened
@@ -1166,7 +1283,17 @@ export const model = {
 
             ws.onerror = (err) => {
               clearTimeout(timeout);
-              reject(new Error(`WebSocket error: ${err}`));
+              ws.close();
+              // `err` is a bare Event on most runtimes (no useful .message),
+              // so surface the URL/readyState instead of stringifying it —
+              // `${err}` on an Event typically yields "[object Event]".
+              const detail = err && typeof err === "object" &&
+                  "message" in err
+                ? String((err as { message: unknown }).message)
+                : `readyState=${ws.readyState}`;
+              reject(
+                new Error(`WebSocket error connecting to ${wsUrl}: ${detail}`),
+              );
             };
 
             ws.onclose = () => {
@@ -1174,6 +1301,25 @@ export const model = {
             };
           },
         );
+
+        // Best-effort session logout — the TOKEN cookie stays valid on the
+        // console until it naturally expires otherwise. Never fails the
+        // method: this is cleanup, not part of the actual scan.
+        try {
+          await fetch(`${baseUrl}/api/auth/logout`, {
+            method: "POST",
+            headers: {
+              "x-csrf-token": csrfToken,
+              "Cookie": `TOKEN=${sessionCookie}`,
+            },
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          });
+        } catch (e) {
+          context.logger.warn(
+            "Failed to log out of UDM session (non-fatal): {error}",
+            { error: e instanceof Error ? e.message : String(e) },
+          );
+        }
 
         // Step 4: Parse the SYSTEM message
         const { os, controllers: controllerUpdates } = mapSystemMessage(
@@ -1187,6 +1333,12 @@ export const model = {
           controllers: controllerUpdates,
         });
 
+        context.logger.info(
+          "UDM update scan complete: OS updateAvailable={updateAvailable}",
+          {
+            updateAvailable: os.updateAvailable,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1198,6 +1350,9 @@ export const model = {
         "networkId). Same mode/fan-out rules as scan.",
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
+        context.logger.info("Scanning connected clients ({mode} mode)", {
+          mode: context.globalArgs.mode,
+        });
         const g = context.globalArgs;
         const targets = await resolveTargets(g);
         const disambiguate = targets.length > 1;
@@ -1300,6 +1455,9 @@ export const model = {
           }
         }
 
+        context.logger.info("Wrote {count} site client snapshot(s)", {
+          count: dataHandles.length,
+        });
         return { dataHandles };
       },
     },
@@ -1321,6 +1479,9 @@ export const model = {
         args: { siteId: string; policyId: string; consoleId?: string },
         context: Ctx,
       ) => {
+        context.logger.info("Deleting firewall policy {policyId}", {
+          policyId: args.policyId,
+        });
         const g = context.globalArgs;
         let targets = await resolveTargets(g);
         if (args.consoleId) {
@@ -1336,8 +1497,22 @@ export const model = {
         const policyUrl =
           `${t.base}/v1/sites/${args.siteId}/firewall/policies/${args.policyId}`;
 
-        // Verify before destroying (rule #5): must exist and be user-defined
-        const policy = await apiGet(policyUrl, g.apiKey, t.insecure);
+        // Verify before destroying (rule #5): must exist and be user-defined.
+        // A 404 here means the policy is already gone — succeed rather than
+        // throw, so a repeated deletePolicy call is idempotent.
+        let policy: Record<string, unknown>;
+        try {
+          policy = await apiGet(policyUrl, g.apiKey, t.insecure);
+        } catch (e) {
+          if (e instanceof Error && /\(404\)/.test(e.message)) {
+            context.logger.info(
+              "Policy {policyId} already gone — treating as deleted",
+              { policyId: args.policyId },
+            );
+            return { dataHandles: [] };
+          }
+          throw e;
+        }
         const origin = (policy.metadata as Obj)?.origin;
         if (origin !== "USER_DEFINED") {
           throw new Error(
@@ -1346,7 +1521,16 @@ export const model = {
           );
         }
 
-        await apiDelete(policyUrl, g.apiKey, t.insecure);
+        // The DELETE itself can also 404 (TOCTOU: something else deleted the
+        // policy between the check above and here) — same idempotent success.
+        try {
+          await apiDelete(policyUrl, g.apiKey, t.insecure);
+        } catch (e) {
+          if (!(e instanceof Error && /\(404\)/.test(e.message))) throw e;
+        }
+        context.logger.info("Deleted firewall policy {policyId}", {
+          policyId: args.policyId,
+        });
         return { dataHandles: [] };
       },
     },

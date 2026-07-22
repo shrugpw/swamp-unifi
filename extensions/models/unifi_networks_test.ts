@@ -6,16 +6,35 @@
  * Run with: deno test extensions/models/unifi_networks_test.ts
  */
 
-import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
+import { createModelTestContext, withMockedFetch } from "jsr:@swamp-club/swamp-testing";
 import {
   buildCurlArgs,
+  buildCurlConfig,
+  describePorts,
+  describeProtocol,
+  describeTrafficFilter,
   extractSessionToken,
+  fetchAllPages,
   finalizeResponse,
+  instanceName,
   ipv4InSubnet,
   ipv4ToInt,
   mapSystemMessage,
+  model,
   parseCurlOutput,
+  resolveTargets,
+  type Target,
 } from "./unifi_networks.ts";
+
+/** GlobalArgs cast helper: the real Ctx type is narrower than the test
+ * harness's Record<string, unknown> globalArgs, so a cast is needed at the
+ * call boundary — the values themselves are still fully real/runtime-checked. */
+// deno-lint-ignore no-explicit-any
+function testCtx(globalArgs: Record<string, unknown>, opts?: Record<string, unknown>) {
+  const ctx = createModelTestContext({ globalArgs, ...opts });
+  return { ...ctx, context: ctx.context as any };
+}
 
 // ── parseCurlOutput ───────────────────────────────────────────────────────────
 
@@ -74,11 +93,11 @@ Deno.test("finalizeResponse: 5xx throws", () => {
 
 // ── buildCurlArgs ─────────────────────────────────────────────────────────────
 
-Deno.test("buildCurlArgs: GET includes -k, verb, auth, status writeout", () => {
-  const args = buildCurlArgs("GET", "https://udm/x", "secret");
+Deno.test("buildCurlArgs: GET includes -k, -K stdin config, verb, status writeout", () => {
+  const args = buildCurlArgs("GET", "https://udm/x");
   assertEquals(args.includes("-sk"), true); // -k skips TLS verify
+  assertEquals(args[args.indexOf("-K") + 1], "-"); // headers read from stdin, not argv
   assertEquals(args[args.indexOf("-X") + 1], "GET");
-  assertEquals(args.includes("X-API-KEY: secret"), true);
   assertEquals(args[args.indexOf("-w") + 1], "\n%{http_code}");
   assertEquals(args[args.length - 1], "https://udm/x"); // url is last
   // No body → no content-type / data
@@ -87,17 +106,36 @@ Deno.test("buildCurlArgs: GET includes -k, verb, auth, status writeout", () => {
 });
 
 Deno.test("buildCurlArgs: body adds content-type and serialized payload", () => {
-  const args = buildCurlArgs("PATCH", "https://udm/p", "secret", { enabled: false });
+  const args = buildCurlArgs("PATCH", "https://udm/p", { enabled: false });
   assertEquals(args.includes("Content-Type: application/json"), true);
   assertEquals(args[args.indexOf("--data-binary") + 1], '{"enabled":false}');
   assertEquals(args[args.indexOf("-X") + 1], "PATCH");
   assertEquals(args[args.length - 1], "https://udm/p");
 });
 
-Deno.test("buildCurlArgs: secret is passed as a header arg, never inline in url", () => {
-  const args = buildCurlArgs("GET", "https://udm/x", "s3cr3t");
-  // key travels only in the X-API-KEY header, not smuggled into the URL
-  assertEquals(args[args.length - 1].includes("s3cr3t"), false);
+Deno.test("buildCurlArgs: no secret ever appears in argv (routed via -K stdin instead)", () => {
+  // The whole point of the -K/stdin design: buildCurlArgs doesn't even accept
+  // an apiKey parameter anymore, so there's no argv slot for a secret to leak
+  // into — verified structurally by the function's arity/signature above,
+  // and here by confirming a representative secret-shaped string is absent.
+  const args = buildCurlArgs("GET", "https://udm/x");
+  assertEquals(args.some((a) => a.includes("s3cr3t")), false);
+});
+
+// ── buildCurlConfig ───────────────────────────────────────────────────────────
+
+Deno.test("buildCurlConfig: formats one header-line per entry", () => {
+  const config = buildCurlConfig({
+    "X-API-KEY": "secret123",
+    "Accept": "application/json",
+  });
+  assertEquals(config.includes('header = "X-API-KEY: secret123"'), true);
+  assertEquals(config.includes('header = "Accept: application/json"'), true);
+});
+
+Deno.test("buildCurlConfig: escapes embedded quotes and backslashes", () => {
+  const config = buildCurlConfig({ "X-API-KEY": 'weird"key\\value' });
+  assertEquals(config, 'header = "X-API-KEY: weird\\"key\\\\value"\n');
 });
 
 // ── ipv4ToInt ─────────────────────────────────────────────────────────────────
@@ -214,4 +252,312 @@ Deno.test("mapSystemMessage: controller updateAvailable null (offline) coalesces
   assertEquals(controllers.length, 2);
   assertEquals(controllers[0].updateAvailable, "10.4.57");
   assertEquals(controllers[1].updateAvailable, undefined);
+});
+
+// ── instanceName ──────────────────────────────────────────────────────────────
+
+const localTarget: Target = { base: "https://udm", target: "udm", insecure: false };
+
+Deno.test("instanceName: single-target scan uses the bare site name", () => {
+  assertEquals(instanceName(localTarget, "Default", false), "Default");
+});
+
+Deno.test("instanceName: multi-console suffix uses consoleId, not just consoleShortname", () => {
+  const t: Target = {
+    base: "https://x",
+    target: "console-1",
+    consoleId: "console-1",
+    consoleShortname: "UDMPRO",
+    insecure: false,
+  };
+  assertEquals(instanceName(t, "Default", true), "Default-UDMPRO-console-1");
+});
+
+Deno.test("instanceName: two same-model consoles with a same-named site no longer collide", () => {
+  // Regression: consoleShortname alone ("UDMPRO") is a hardware model name,
+  // not unique per device — two consoles of the same model previously
+  // produced the identical instance name for a same-named site.
+  const a: Target = {
+    base: "https://a",
+    target: "console-a",
+    consoleId: "console-a",
+    consoleShortname: "UDMPRO",
+    insecure: false,
+  };
+  const b: Target = {
+    base: "https://b",
+    target: "console-b",
+    consoleId: "console-b",
+    consoleShortname: "UDMPRO",
+    insecure: false,
+  };
+  const nameA = instanceName(a, "Default", true);
+  const nameB = instanceName(b, "Default", true);
+  assertEquals(nameA === nameB, false);
+});
+
+Deno.test("instanceName: sanitizes characters outside [A-Za-z0-9._-]", () => {
+  assertEquals(instanceName(localTarget, "My Site!", false), "My-Site-");
+});
+
+// ── describeProtocol / describePorts / describeTrafficFilter ─────────────────
+
+Deno.test("describeProtocol: NAMED_PROTOCOL, PROTOCOL_NUMBER, PRESET, and no-filter cases", () => {
+  assertEquals(describeProtocol(undefined), undefined);
+  assertEquals(
+    describeProtocol({ protocolFilter: undefined }),
+    "all",
+  );
+  assertEquals(
+    describeProtocol({
+      protocolFilter: { type: "NAMED_PROTOCOL", protocol: { name: "tcp" } },
+    }),
+    "tcp",
+  );
+  assertEquals(
+    describeProtocol({
+      protocolFilter: {
+        type: "NAMED_PROTOCOL",
+        matchOpposite: true,
+        protocol: { name: "tcp" },
+      },
+    }),
+    "not tcp",
+  );
+  assertEquals(
+    describeProtocol({
+      protocolFilter: { type: "PROTOCOL_NUMBER", protocolNumber: 47 },
+    }),
+    "proto 47",
+  );
+  assertEquals(
+    describeProtocol({
+      protocolFilter: { type: "PRESET", preset: { name: "TCP_UDP" } },
+    }),
+    "tcp_udp",
+  );
+});
+
+Deno.test("describePorts: single ports, ranges, negation, and non-PORTS filter", () => {
+  assertEquals(describePorts(undefined), undefined);
+  assertEquals(describePorts({ type: "IP_ADDRESSES" }), "traffic-matching-list");
+  assertEquals(
+    describePorts({
+      type: "PORTS",
+      items: [
+        { type: "PORT_NUMBER", value: 22 },
+        { type: "PORT_NUMBER_RANGE", start: 8000, stop: 8080 },
+      ],
+    }),
+    "22, 8000-8080",
+  );
+  assertEquals(
+    describePorts({
+      type: "PORTS",
+      matchOpposite: true,
+      items: [{ type: "PORT_NUMBER", value: 443 }],
+    }),
+    "not 443",
+  );
+});
+
+Deno.test("describeTrafficFilter: NETWORK filter resolves zone names, IP_ADDRESS lists values", () => {
+  const zoneNames = { "z1": "Trusted" };
+  assertEquals(
+    describeTrafficFilter(
+      { type: "NETWORK", networkFilter: { networkIds: ["z1"] } },
+      zoneNames,
+    ),
+    "networks Trusted",
+  );
+  assertEquals(
+    describeTrafficFilter(
+      {
+        type: "IP_ADDRESS",
+        ipAddressFilter: {
+          type: "IP_ADDRESSES",
+          items: [{ value: "10.0.0.5" }],
+        },
+      },
+      {},
+    ),
+    "ip 10.0.0.5",
+  );
+  assertEquals(describeTrafficFilter(undefined, {}), undefined);
+});
+
+// ── fetchAllPages ─────────────────────────────────────────────────────────────
+
+Deno.test("fetchAllPages: stops on a short page even when totalCount is absent", async () => {
+  // Regression for the truncation bug: a missing totalCount used to coalesce
+  // to 0 via `?? 0`, making `items.length >= 0` true after the very first
+  // full page and silently truncating results. The short-page signal alone
+  // must now correctly continue past a full first page.
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    const offset = Number(url.searchParams.get("offset"));
+    if (offset === 0) {
+      // First page: exactly `limit` items, no totalCount in the envelope.
+      return Response.json({
+        data: Array.from({ length: 100 }, (_, i) => ({ id: `n${i}` })),
+      });
+    }
+    // Second page: fewer than limit -> short page -> stop.
+    return Response.json({ data: [{ id: "n100" }] });
+  }, async () => {
+    return await fetchAllPages("https://udm", "/v1/sites", "key", false);
+  });
+  assertEquals(result.length, 101);
+});
+
+Deno.test("fetchAllPages: totalCount, when present, is an early-exit optimization only", async () => {
+  const { result, calls } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    const offset = Number(url.searchParams.get("offset"));
+    if (offset === 0) {
+      return Response.json({
+        data: Array.from({ length: 100 }, (_, i) => ({ id: `n${i}` })),
+        totalCount: 100,
+      });
+    }
+    throw new Error("should not fetch a second page when totalCount is met");
+  }, async () => {
+    return await fetchAllPages("https://udm", "/v1/sites", "key", false);
+  });
+  assertEquals(result.length, 100);
+  assertEquals(calls.length, 1);
+});
+
+Deno.test("fetchAllPages: empty first page returns immediately", async () => {
+  const { result, calls } = await withMockedFetch(() => Response.json({ data: [] }), async () => {
+    return await fetchAllPages("https://udm", "/v1/sites", "key", false);
+  });
+  assertEquals(result.length, 0);
+  assertEquals(calls.length, 1);
+});
+
+// ── resolveTargets ────────────────────────────────────────────────────────────
+
+Deno.test("resolveTargets: cloud mode with no consoleId discovers and paginates through every console", async () => {
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    const offset = Number(url.searchParams.get("offset"));
+    if (offset === 0) {
+      return Response.json({
+        data: Array.from({ length: 100 }, (_, i) => ({
+          id: `console-${i}`,
+          reportedState: { hardware: { shortname: "UDMPRO", name: `Console ${i}` } },
+        })),
+      });
+    }
+    return Response.json({
+      data: [{
+        id: "console-100",
+        reportedState: { hardware: { shortname: "UDMPRO", name: "Console 100" } },
+      }],
+    });
+  }, async () => {
+    return await resolveTargets(
+      { mode: "cloud", apiKey: "key", verifyTls: true } as Parameters<
+        typeof resolveTargets
+      >[0],
+    );
+  });
+  // Regression: consoles discovery previously used a single un-paginated
+  // apiGet, silently missing consoles beyond the first ~100.
+  assertEquals(result.length, 101);
+});
+
+Deno.test("resolveTargets: cloud mode throws when the key sees no consoles", async () => {
+  await withMockedFetch(() => Response.json({ data: [] }), async () => {
+    await assertRejects(
+      () =>
+        resolveTargets(
+          { mode: "cloud", apiKey: "key", verifyTls: true } as Parameters<
+            typeof resolveTargets
+          >[0],
+        ),
+      Error,
+      "No consoles visible",
+    );
+  });
+});
+
+// ── deletePolicy (model-level, via createModelTestContext + withMockedFetch) ──
+
+Deno.test("deletePolicy: refuses to delete a non-USER_DEFINED policy", async () => {
+  const { context } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  await withMockedFetch(
+    () =>
+      Response.json({
+        id: "p1",
+        name: "System Rule",
+        metadata: { origin: "PREDEFINED" },
+      }),
+    async () => {
+      await assertRejects(
+        () =>
+          model.methods.deletePolicy.execute(
+            { siteId: "s1", policyId: "p1" },
+            context,
+          ),
+        Error,
+        "only USER_DEFINED policies are deletable",
+      );
+    },
+  );
+});
+
+Deno.test("deletePolicy: idempotent when the policy is already gone (404 on pre-check)", async () => {
+  const { context } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch(
+    () => new Response("not found", { status: 404 }),
+    async () =>
+      await model.methods.deletePolicy.execute(
+        { siteId: "s1", policyId: "p1" },
+        context,
+      ),
+  );
+  assertEquals(result, { dataHandles: [] });
+});
+
+Deno.test("deletePolicy: idempotent on a TOCTOU 404 from the delete call itself", async () => {
+  const { context } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  let call = 0;
+  const { result } = await withMockedFetch(
+    (req) => {
+      call++;
+      if (req.method === "GET") {
+        return Response.json({
+          id: "p1",
+          name: "My Rule",
+          metadata: { origin: "USER_DEFINED" },
+        });
+      }
+      // DELETE races with something else that already removed it.
+      return new Response("not found", { status: 404 });
+    },
+    async () =>
+      await model.methods.deletePolicy.execute(
+        { siteId: "s1", policyId: "p1" },
+        context,
+      ),
+  );
+  assertEquals(result, { dataHandles: [] });
+  assertEquals(call, 2); // GET (exists check) + DELETE
 });
