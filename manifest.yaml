@@ -1,13 +1,14 @@
 manifestVersion: 1
 name: "@shrug/unifi-networks"
-version: "2026.07.11.1"
+version: "2026.07.21.1"
 description: >-
   Query UniFi Network sites via the official integration API — VLANs, firewall
   zones/policies, connected clients, and WiFi SSIDs, all mapped together — with
   firewall-summary and zone-matrix reports. Local (per-console key) or cloud
-  (unifi.ui.com key, multi-console fan-out) mode. Vendored from
-  @dmc/unifi-networks (MIT, Dan McClain) with fixes: optional policy name, and
-  correct PRESET protocol rendering.
+  (unifi.ui.com key, multi-console fan-out) mode. Also fetches UDM OS/app
+  update status via the management-plane websocket (scanUpdates). Vendored
+  from @dmc/unifi-networks (MIT, Dan McClain) with fixes: optional policy
+  name, and correct PRESET protocol rendering.
 
 repository: https://github.com/shrugpw/swamp-unifi
 
