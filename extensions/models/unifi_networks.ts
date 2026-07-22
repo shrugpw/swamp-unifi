@@ -879,14 +879,14 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.7",
+  version: "2026.07.21.8",
   globalArguments: GlobalArgsSchema,
   // No-op: globalArguments hasn't changed shape across any prior version —
   // every bump so far has been bug fixes/logging/docs, not schema changes.
   // Establishes the upgrades pattern for whenever a real migration is needed.
   upgrades: [
     {
-      toVersion: "2026.07.21.7",
+      toVersion: "2026.07.21.8",
       description: "Version bump, no globalArguments schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },

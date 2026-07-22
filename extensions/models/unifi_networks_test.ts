@@ -4,8 +4,9 @@
  * Coverage: pure helpers (curl argv/config building, curl stdout parsing,
  * response finalization, IPv4 subnet math, session-token/SYSTEM-message
  * parsing, instance-name sanitization), the retry/backoff logic in
- * apiRequest, and full method execution (scan, consoles, deletePolicy) via
- * createModelTestContext + withMockedFetch.
+ * apiRequest, and full method execution (scan, scanFirewall, scanWifi,
+ * scanClients, consoles, deletePolicy) via createModelTestContext +
+ * withMockedFetch.
  *
  * NOT covered end-to-end: curlRequest's actual `Deno.Command` spawn+stdin-pipe
  * behavior (only its pure argv/config-building helpers are tested) —
@@ -693,6 +694,107 @@ Deno.test("scan: writes one siteNetworks resource per site (local mode)", async 
     (written[0].data.networks as Array<{ name: string }>)[0].name,
     "LAN",
   );
+});
+
+Deno.test("scanFirewall: joins policies to zone names via mapPolicy", async () => {
+  const { context, getWrittenResources } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    if (url.pathname.endsWith("/v1/sites")) {
+      return Response.json({ data: [{ id: "s1", name: "Default" }] });
+    }
+    if (url.pathname.endsWith("/firewall/zones")) {
+      return Response.json({
+        data: [
+          { id: "z1", name: "Trusted", networkIds: [] },
+          { id: "z2", name: "Guest", networkIds: [] },
+        ],
+      });
+    }
+    if (url.pathname.endsWith("/firewall/policies")) {
+      return Response.json({
+        data: [{
+          id: "p1",
+          name: "Block Guest to Trusted",
+          enabled: true,
+          index: 1,
+          action: { type: "BLOCK" },
+          source: { zoneId: "z2" },
+          destination: { zoneId: "z1" },
+        }],
+      });
+    }
+    throw new Error(`unexpected request: ${req.method} ${req.url}`);
+  }, async () => {
+    return await model.methods.scanFirewall.execute({}, context);
+  });
+
+  assertEquals(result.dataHandles.length, 1);
+  const written = getWrittenResources()[0];
+  assertEquals(written.data.zoneCount, 2);
+  assertEquals(written.data.policyCount, 1);
+  const policy = (written.data.policies as Array<
+    { sourceZone?: string; destinationZone?: string }
+  >)[0];
+  assertEquals(policy.sourceZone, "Guest");
+  assertEquals(policy.destinationZone, "Trusted");
+});
+
+Deno.test("scanWifi: maps SPECIFIC network ref to its VLAN, NATIVE ref to the default network", async () => {
+  const { context, getWrittenResources } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    if (url.pathname.endsWith("/v1/sites")) {
+      return Response.json({ data: [{ id: "s1", name: "Default" }] });
+    }
+    if (url.pathname.endsWith("/networks")) {
+      return Response.json({
+        data: [
+          { id: "n1", name: "LAN", vlanId: 1, default: true, management: "auto", enabled: true },
+          { id: "n2", name: "IOT", vlanId: 20, default: false, management: "auto", enabled: true },
+        ],
+      });
+    }
+    if (url.pathname.endsWith("/wifi/broadcasts")) {
+      return Response.json({
+        data: [
+          {
+            id: "w1",
+            name: "MainWifi",
+            enabled: true,
+            type: "STANDARD",
+            network: { type: "NATIVE" },
+          },
+          {
+            id: "w2",
+            name: "IotWifi",
+            enabled: true,
+            type: "IOT_OPTIMIZED",
+            network: { type: "SPECIFIC", networkId: "n2" },
+          },
+        ],
+      });
+    }
+    throw new Error(`unexpected request: ${req.method} ${req.url}`);
+  }, async () => {
+    return await model.methods.scanWifi.execute({}, context);
+  });
+
+  assertEquals(result.dataHandles.length, 1);
+  const written = getWrittenResources()[0];
+  const wifis = written.data.wifis as Array<{ name: string; vlanId?: number }>;
+  assertEquals(wifis.find((w) => w.name === "MainWifi")?.vlanId, 1); // NATIVE -> default net
+  assertEquals(wifis.find((w) => w.name === "IotWifi")?.vlanId, 20); // SPECIFIC -> n2
 });
 
 Deno.test("consoles: requires cloud mode", async () => {
