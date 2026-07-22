@@ -1,9 +1,20 @@
 /**
- * Unit tests for the pure request-handling seams of the unifi-networks
- * extension — focused on the insecure (curl) path, whose string-surgery on
- * curl's stdout is the most regression-prone logic in the transport layer.
+ * Unit and model-level tests for the unifi-networks extension.
  *
- * Run with: deno test extensions/models/unifi_networks_test.ts
+ * Coverage: pure helpers (curl argv/config building, curl stdout parsing,
+ * response finalization, IPv4 subnet math, session-token/SYSTEM-message
+ * parsing, instance-name sanitization), the retry/backoff logic in
+ * apiRequest, and full method execution (scan, consoles, deletePolicy) via
+ * createModelTestContext + withMockedFetch.
+ *
+ * NOT covered end-to-end: curlRequest's actual `Deno.Command` spawn+stdin-pipe
+ * behavior (only its pure argv/config-building helpers are tested) —
+ * @swamp-club/swamp-testing's withMockedCommand does not support intercepting
+ * `spawn()`, only `output()`-style one-shot commands. Likewise scanUpdates'
+ * WebSocket step has no mock primitive available. Both are accepted,
+ * documented gaps rather than silently-skipped ones.
+ *
+ * Run with: deno test --allow-net extensions/models/unifi_networks_test.ts
  */
 
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
@@ -691,6 +702,57 @@ Deno.test("consoles: requires cloud mode", async () => {
     Error,
     "requires mode='cloud'",
   );
+});
+
+Deno.test("scanClients: byVlan groups by networkId, not networkName — same-named VLANs don't merge", async () => {
+  const { context, getWrittenResources } = testCtx({
+    mode: "local",
+    apiKey: "key",
+    host: "udm.example",
+    verifyTls: true,
+  });
+  const { result } = await withMockedFetch((req) => {
+    const url = new URL(req.url);
+    if (url.pathname.endsWith("/v1/sites")) {
+      return Response.json({ data: [{ id: "s1", name: "Default" }] });
+    }
+    if (/\/networks\/n[12]$/.test(url.pathname)) {
+      const hostIp = url.pathname.endsWith("/n1") ? "10.0.10.1" : "10.0.20.1";
+      return Response.json({ ipv4Configuration: { hostIpAddress: hostIp, prefixLength: 24 } });
+    }
+    if (url.pathname.endsWith("/networks")) {
+      // Two distinct VLANs that happen to share a display name.
+      return Response.json({
+        data: [
+          { id: "n1", name: "Guest", vlanId: 10, management: "auto", enabled: true, default: false },
+          { id: "n2", name: "Guest", vlanId: 20, management: "auto", enabled: true, default: false },
+        ],
+      });
+    }
+    if (url.pathname.endsWith("/clients")) {
+      return Response.json({
+        data: [
+          { id: "c1", name: "client-a", type: "WIRED", ipAddress: "10.0.10.5" },
+          { id: "c2", name: "client-b", type: "WIRED", ipAddress: "10.0.20.5" },
+        ],
+      });
+    }
+    throw new Error(`unexpected request: ${req.method} ${req.url}`);
+  }, async () => {
+    return await model.methods.scanClients.execute({}, context);
+  });
+
+  assertEquals(result.dataHandles.length, 1);
+  const written = getWrittenResources()[0];
+  assertEquals(written.data.unmappedCount, 0);
+  const byVlan = written.data.byVlan as Array<
+    { vlanId?: number; networkName: string; clientCount: number }
+  >;
+  // Regression: previously keyed by networkName, so both "Guest" VLANs would
+  // have collapsed into a single entry with clientCount 2.
+  assertEquals(byVlan.length, 2);
+  assertEquals(byVlan.find((v) => v.vlanId === 10)?.clientCount, 1);
+  assertEquals(byVlan.find((v) => v.vlanId === 20)?.clientCount, 1);
 });
 
 Deno.test("consoles: writes discovered consoles in cloud mode", async () => {

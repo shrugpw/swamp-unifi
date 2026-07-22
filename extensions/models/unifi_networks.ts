@@ -242,6 +242,12 @@ export function buildCurlArgs(
     method,
     "--connect-timeout",
     "10",
+    // --connect-timeout only bounds the TCP handshake; --max-time bounds the
+    // whole request (matching the fetch transport's AbortSignal.timeout), so
+    // a UDM that connects fine but then stalls mid-response can't hang the
+    // method indefinitely.
+    "--max-time",
+    String(FETCH_TIMEOUT_MS / 1000),
     "-w",
     "\n%{http_code}",
   ];
@@ -340,9 +346,17 @@ async function curlRequest(
     stderr: "piped",
   });
   const child = cmd.spawn();
-  const writer = child.stdin.getWriter();
-  await writer.write(new TextEncoder().encode(config));
-  await writer.close();
+  try {
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode(config));
+    await writer.close();
+  } catch (e) {
+    // Reap the spawned process even if writing its stdin config failed,
+    // then surface the original error — otherwise a write failure here
+    // would leak a child process.
+    await child.output().catch(() => {});
+    throw e;
+  }
   const out = await child.output();
   if (out.code !== 0) {
     throw new Error(
@@ -865,14 +879,14 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.6",
+  version: "2026.07.21.7",
   globalArguments: GlobalArgsSchema,
   // No-op: globalArguments hasn't changed shape across any prior version —
   // every bump so far has been bug fixes/logging/docs, not schema changes.
   // Establishes the upgrades pattern for whenever a real migration is needed.
   upgrades: [
     {
-      toVersion: "2026.07.21.6",
+      toVersion: "2026.07.21.7",
       description: "Version bump, no globalArguments schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
@@ -1441,11 +1455,14 @@ export const model = {
             >();
             let unmapped = 0;
             for (const c of clients) {
-              if (!c.networkName) {
+              // Key by networkId, not networkName: two distinct VLANs can
+              // share a display name, and grouping by name would silently
+              // merge their counts under whichever one's vlanId won the race.
+              if (!c.networkId || !c.networkName) {
                 unmapped++;
                 continue;
               }
-              const key = c.networkName;
+              const key = c.networkId;
               const entry = counts.get(key) ??
                 {
                   vlanId: c.vlanId,
