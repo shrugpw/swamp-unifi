@@ -30,7 +30,11 @@ matrix.
 - **cloud** discovers consoles automatically; pin one with `consoleId`.
 - `scanUpdates` additionally requires `username`/`password` — the UniFi OS
   local admin account (not the Integration API key), since update status is
-  only exposed via the management-plane websocket.
+  only exposed via the management-plane websocket. If that account has MFA
+  enabled, also set `totpSecret` (the account's base32 TOTP seed) — MFA
+  accounts reject password-only logins with `MFA_AUTH_REQUIRED`, and the
+  extension derives the current code in-process at login. Local-only admin
+  accounts bypass SSO MFA and can omit it.
 
 ## Methods
 
@@ -83,6 +87,12 @@ For `scanUpdates`, also pass the UniFi OS local admin credentials:
 ```bash
   --global-arg 'username=${{ vault.get("udm", "username") }}' \
   --global-arg 'password=${{ vault.get("udm", "password") }}'
+```
+
+If that admin account has MFA enabled, also pass its base32 TOTP seed:
+
+```bash
+  --global-arg 'totpSecret=${{ vault.get("udm", "totp-secret") }}'
 ```
 
 Run methods against the instance:
