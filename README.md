@@ -58,8 +58,6 @@ Both run automatically after `scanFirewall`:
 
 - `scanClients` maps clients to VLANs by **IPv4** subnet only; IPv6-only clients
   fall into `unmappedCount`.
-- In `local` mode the API key is passed to `curl` via a `-H` argument, so it is
-  visible in the host process list for the duration of the call.
 
 ## Install & Usage
 

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@shrug/unifi-networks"
-version: "2026.07.21.4"
+version: "2026.07.21.5"
 description: |-
   Query UniFi Network sites via the official integration API — VLANs, firewall
   zones/policies, connected clients, and WiFi SSIDs, all mapped together — with

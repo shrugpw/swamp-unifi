@@ -9,6 +9,7 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import { createModelTestContext, withMockedFetch } from "jsr:@swamp-club/swamp-testing";
 import {
+  apiRequest,
   buildCurlArgs,
   buildCurlConfig,
   describePorts,
@@ -24,6 +25,7 @@ import {
   model,
   parseCurlOutput,
   resolveTargets,
+  sanitizeInstanceName,
   type Target,
 } from "./unifi_networks.ts";
 
@@ -560,4 +562,70 @@ Deno.test("deletePolicy: idempotent on a TOCTOU 404 from the delete call itself"
   );
   assertEquals(result, { dataHandles: [] });
   assertEquals(call, 2); // GET (exists check) + DELETE
+});
+
+// ── sanitizeInstanceName ──────────────────────────────────────────────────────
+
+Deno.test("sanitizeInstanceName: strips characters unsafe for on-disk storage paths", () => {
+  assertEquals(sanitizeInstanceName("udm.example.com"), "udm.example.com");
+  assertEquals(sanitizeInstanceName("fe80::1"), "fe80--1"); // IPv6 colons
+  assertEquals(sanitizeInstanceName("My Site!"), "My-Site-");
+});
+
+// ── apiRequest retry/backoff ──────────────────────────────────────────────────
+
+Deno.test("apiRequest: retries 429 and succeeds once a good response arrives", async () => {
+  const { result, calls } = await withMockedFetch([
+    new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }),
+    new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }),
+    Response.json({ ok: true }),
+  ], async () => {
+    return await apiRequest("GET", "https://udm/x", "key");
+  });
+  assertEquals(result, { ok: true });
+  assertEquals(calls.length, 3);
+});
+
+Deno.test("apiRequest: retries 503 the same way as 429", async () => {
+  const { result, calls } = await withMockedFetch([
+    new Response("unavailable", { status: 503, headers: { "Retry-After": "0" } }),
+    Response.json({ ok: true }),
+  ], async () => {
+    return await apiRequest("GET", "https://udm/x", "key");
+  });
+  assertEquals(result, { ok: true });
+  assertEquals(calls.length, 2);
+});
+
+Deno.test("apiRequest: gives up after MAX_RETRIES on a persistent 429 and throws", async () => {
+  // 1 initial attempt + 3 retries = 4 total requests before finalizeResponse
+  // throws on the 4th's still-429 status.
+  const responses = Array.from(
+    { length: 4 },
+    () => new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }),
+  );
+  const { calls } = await withMockedFetch(responses, async () => {
+    await assertRejects(
+      () => apiRequest("GET", "https://udm/x", "key"),
+      Error,
+      "(429)",
+    );
+  });
+  assertEquals(calls.length, 4);
+});
+
+Deno.test("apiRequest: Retry-After header value is honored over default backoff", async () => {
+  // Retry-After: 0 means an immediate retry rather than waiting the default
+  // exponential backoff (500ms+) — keeps this test fast while proving the
+  // header-driven path (not just the backoff path) is what's exercised.
+  const start = performance.now();
+  const { result } = await withMockedFetch([
+    new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }),
+    Response.json({ ok: true }),
+  ], async () => {
+    return await apiRequest("GET", "https://udm/x", "key");
+  });
+  const elapsedMs = performance.now() - start;
+  assertEquals(result, { ok: true });
+  assertEquals(elapsedMs < 400, true); // well under the 500ms base backoff
 });

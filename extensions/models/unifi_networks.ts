@@ -372,7 +372,7 @@ function sleep(ms: number): Promise<void> {
  * header visibility here, so it always falls back to backoff. Verb helpers
  * below are thin wrappers over this.
  */
-async function apiRequest(
+export async function apiRequest(
   method: string,
   url: string,
   apiKey: string,
@@ -812,6 +812,15 @@ export async function resolveTargets(g: GlobalArgs): Promise<Target[]> {
 }
 
 /**
+ * Instance names map directly to on-disk storage paths, so every write must
+ * go through this — a raw hostname (e.g. an IPv6 literal with colons) or site
+ * name can carry characters that aren't safe there. Exported for testing.
+ */
+export function sanitizeInstanceName(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9._-]/g, "-");
+}
+
+/**
  * Data instance name for a site. Uses the bare site name for single-target
  * scans so local and cloud modes converge on the same instance; only appends
  * a console-identity suffix when fanning out over multiple consoles, where it
@@ -834,7 +843,7 @@ export function instanceName(
       : t.consoleId)
     : undefined;
   const raw = suffix ? `${siteName}-${suffix}` : siteName;
-  return raw.replace(/[^A-Za-z0-9._-]/g, "-");
+  return sanitizeInstanceName(raw);
 }
 
 // ── model ─────────────────────────────────────────────────────────────────────
@@ -856,14 +865,14 @@ interface Ctx {
 
 export const model = {
   type: "@shrug/unifi-networks",
-  version: "2026.07.21.4",
+  version: "2026.07.21.5",
   globalArguments: GlobalArgsSchema,
   // No-op: globalArguments hasn't changed shape across any prior version —
   // every bump so far has been bug fixes/logging/docs, not schema changes.
   // Establishes the upgrades pattern for whenever a real migration is needed.
   upgrades: [
     {
-      toVersion: "2026.07.21.4",
+      toVersion: "2026.07.21.5",
       description: "Version bump, no globalArguments schema changes",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
@@ -1257,68 +1266,77 @@ export const model = {
           },
         });
 
-        const systemData = await new Promise<Record<string, unknown>>(
-          (resolve, reject) => {
-            const timeout = setTimeout(() => {
-              ws.close();
-              reject(new Error("WebSocket timeout waiting for SYSTEM message"));
-            }, 15000);
-
-            ws.onopen = () => {
-              // Connection opened
-            };
-
-            ws.onmessage = (event) => {
-              try {
-                const msg = JSON.parse(event.data as string);
-                if (msg.type === "SYSTEM") {
-                  clearTimeout(timeout);
-                  ws.close();
-                  resolve(msg);
-                }
-              } catch {
-                // Ignore parse errors from non-JSON messages
-              }
-            };
-
-            ws.onerror = (err) => {
-              clearTimeout(timeout);
-              ws.close();
-              // `err` is a bare Event on most runtimes (no useful .message),
-              // so surface the URL/readyState instead of stringifying it —
-              // `${err}` on an Event typically yields "[object Event]".
-              const detail = err && typeof err === "object" &&
-                  "message" in err
-                ? String((err as { message: unknown }).message)
-                : `readyState=${ws.readyState}`;
-              reject(
-                new Error(`WebSocket error connecting to ${wsUrl}: ${detail}`),
-              );
-            };
-
-            ws.onclose = () => {
-              // Connection closed
-            };
-          },
-        );
-
-        // Best-effort session logout — the TOKEN cookie stays valid on the
-        // console until it naturally expires otherwise. Never fails the
-        // method: this is cleanup, not part of the actual scan.
+        let systemData: Record<string, unknown>;
         try {
-          await fetch(`${baseUrl}/api/auth/logout`, {
-            method: "POST",
-            headers: {
-              "x-csrf-token": csrfToken,
-              "Cookie": `TOKEN=${sessionCookie}`,
+          systemData = await new Promise<Record<string, unknown>>(
+            (resolve, reject) => {
+              const timeout = setTimeout(() => {
+                ws.close();
+                reject(
+                  new Error("WebSocket timeout waiting for SYSTEM message"),
+                );
+              }, 15000);
+
+              ws.onopen = () => {
+                // Connection opened
+              };
+
+              ws.onmessage = (event) => {
+                try {
+                  const msg = JSON.parse(event.data as string);
+                  if (msg.type === "SYSTEM") {
+                    clearTimeout(timeout);
+                    ws.close();
+                    resolve(msg);
+                  }
+                } catch {
+                  // Ignore parse errors from non-JSON messages
+                }
+              };
+
+              ws.onerror = (err) => {
+                clearTimeout(timeout);
+                ws.close();
+                // `err` is a bare Event on most runtimes (no useful .message),
+                // so surface the URL/readyState instead of stringifying it —
+                // `${err}` on an Event typically yields "[object Event]".
+                const detail = err && typeof err === "object" &&
+                    "message" in err
+                  ? String((err as { message: unknown }).message)
+                  : `readyState=${ws.readyState}`;
+                reject(
+                  new Error(
+                    `WebSocket error connecting to ${wsUrl}: ${detail}`,
+                  ),
+                );
+              };
+
+              ws.onclose = () => {
+                // Connection closed
+              };
             },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          });
-        } catch (e) {
-          context.logger.warn(
-            "Failed to log out of UDM session (non-fatal): {error}",
-            { error: e instanceof Error ? e.message : String(e) },
           );
+        } finally {
+          // Best-effort session logout — the TOKEN cookie stays valid on the
+          // console until it naturally expires otherwise. Runs regardless of
+          // whether the WebSocket step above succeeded, timed out, or
+          // errored, so a failed scan doesn't leak a live session. Never
+          // fails the method itself: this is cleanup, not the actual scan.
+          try {
+            await fetch(`${baseUrl}/api/auth/logout`, {
+              method: "POST",
+              headers: {
+                "x-csrf-token": csrfToken,
+                "Cookie": `TOKEN=${sessionCookie}`,
+              },
+              signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+            });
+          } catch (e) {
+            context.logger.warn(
+              "Failed to log out of UDM session (non-fatal): {error}",
+              { error: e instanceof Error ? e.message : String(e) },
+            );
+          }
         }
 
         // Step 4: Parse the SYSTEM message
@@ -1326,12 +1344,16 @@ export const model = {
           systemData,
         );
 
-        const handle = await context.writeResource("consoleUpdates", host, {
-          scannedAt: new Date().toISOString(),
-          host,
-          os,
-          controllers: controllerUpdates,
-        });
+        const handle = await context.writeResource(
+          "consoleUpdates",
+          sanitizeInstanceName(host),
+          {
+            scannedAt: new Date().toISOString(),
+            host,
+            os,
+            controllers: controllerUpdates,
+          },
+        );
 
         context.logger.info(
           "UDM update scan complete: OS updateAvailable={updateAvailable}",
