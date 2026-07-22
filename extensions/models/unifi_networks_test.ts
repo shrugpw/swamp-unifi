@@ -27,6 +27,7 @@ import {
   describePorts,
   describeProtocol,
   describeTrafficFilter,
+  base32Decode,
   extractSessionToken,
   fetchAllPages,
   finalizeResponse,
@@ -39,6 +40,7 @@ import {
   resolveTargets,
   sanitizeInstanceName,
   type Target,
+  totpCode,
 } from "./unifi_networks.ts";
 
 /** GlobalArgs cast helper: the real Ctx type is narrower than the test
@@ -49,6 +51,47 @@ function testCtx(globalArgs: Record<string, unknown>, opts?: Record<string, unkn
   const ctx = createModelTestContext({ globalArgs, ...opts });
   return { ...ctx, context: ctx.context as any };
 }
+
+// ── TOTP (RFC 6238) ───────────────────────────────────────────────────────────
+
+// RFC 6238 Appendix B reference vectors (SHA-1, secret "12345678901234567890").
+const RFC_TOTP_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+Deno.test("totpCode: matches RFC 6238 vectors", async () => {
+  assertEquals(await totpCode(RFC_TOTP_SECRET, 59_000, 30, 8), "94287082");
+  assertEquals(
+    await totpCode(RFC_TOTP_SECRET, 1_111_111_109_000, 30, 8),
+    "07081804",
+  );
+  assertEquals(
+    await totpCode(RFC_TOTP_SECRET, 1_234_567_890_000, 30, 8),
+    "89005924",
+  );
+});
+
+Deno.test("totpCode: defaults to 6 digits and zero-pads", async () => {
+  const code = await totpCode(RFC_TOTP_SECRET, 59_000);
+  assertEquals(code, "287082");
+  assertEquals(code.length, 6);
+});
+
+Deno.test("totpCode: stable within a 30s step, rolls at the boundary", async () => {
+  const a = await totpCode(RFC_TOTP_SECRET, 30_000);
+  const b = await totpCode(RFC_TOTP_SECRET, 59_999);
+  const c = await totpCode(RFC_TOTP_SECRET, 60_000);
+  assertEquals(a, b);
+  assertEquals(a === c, false);
+});
+
+Deno.test("base32Decode: tolerates padding, lowercase and whitespace", () => {
+  assertEquals(base32Decode("MZXW6==="), base32Decode("mzxw6"));
+  assertEquals(base32Decode("MZXW 6"), base32Decode("MZXW6"));
+});
+
+Deno.test("base32Decode: rejects invalid input", () => {
+  assertThrows(() => base32Decode("MZXW1"), Error, "Invalid base32");
+  assertThrows(() => base32Decode(""), Error, "Empty base32");
+});
 
 // ── parseCurlOutput ───────────────────────────────────────────────────────────
 
