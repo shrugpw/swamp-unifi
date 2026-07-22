@@ -28,7 +28,7 @@ const GlobalArgsSchema = z.object({
   ),
   password: z.string().meta({ sensitive: true }).optional().describe(
     "UniFi OS local admin password — required for scanUpdates. " +
-      "Reference a vault secret, e.g. ${{ vault.get(\"udm\", \"password\") }}.",
+      'Reference a vault secret, e.g. ${{ vault.get("udm", "password") }}.',
   ),
 });
 
@@ -661,7 +661,8 @@ export function mapSystemMessage(systemData: Record<string, unknown>): {
   controllers: z.infer<typeof ControllerUpdateSchema>[];
 } {
   const apps = systemData.apps as Record<string, unknown> | undefined;
-  const controllers = (apps?.controllers as Array<Record<string, unknown>>) ?? [];
+  const controllers = (apps?.controllers as Array<Record<string, unknown>>) ??
+    [];
   const system = systemData.system as Record<string, unknown> | undefined;
   const info = system?.info as Record<string, unknown> | undefined;
   const hardware = info?.hardware as Record<string, unknown> | undefined;
@@ -1054,13 +1055,19 @@ export const model = {
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
         if (g.mode !== "local") {
-          throw new Error("scanUpdates requires mode='local' (management-plane access)");
+          throw new Error(
+            "scanUpdates requires mode='local' (management-plane access)",
+          );
         }
         if (!g.host) {
-          throw new Error("scanUpdates requires 'host' (the console IP/hostname)");
+          throw new Error(
+            "scanUpdates requires 'host' (the console IP/hostname)",
+          );
         }
         if (!g.username || !g.password) {
-          throw new Error("scanUpdates requires 'username' and 'password' in globalArgs");
+          throw new Error(
+            "scanUpdates requires 'username' and 'password' in globalArgs",
+          );
         }
 
         const host = g.host;
@@ -1088,7 +1095,9 @@ export const model = {
         );
 
         if (!csrfToken || !sessionCookie) {
-          throw new Error("Failed to extract CSRF token or session cookie from login response");
+          throw new Error(
+            "Failed to extract CSRF token or session cookie from login response",
+          );
         }
 
         // Step 2: POST /api/controllers/checkUpdates to trigger update check
@@ -1102,11 +1111,21 @@ export const model = {
             "Cookie": `TOKEN=${sessionCookie}`,
           },
           body: JSON.stringify({
-            controllersToCheck: ["network", "protect", "access", "talk", "connect", "innerspace"],
+            controllersToCheck: [
+              "network",
+              "protect",
+              "access",
+              "talk",
+              "connect",
+              "innerspace",
+            ],
           }),
         });
         if (checkResp.status < 200 || checkResp.status >= 300) {
-          throw new Error(`checkUpdates failed (${checkResp.status}): ${await checkResp.text()}`);
+          throw new Error(
+            `checkUpdates failed (${checkResp.status}): ${await checkResp
+              .text()}`,
+          );
         }
 
         // Step 3: Open websocket and listen for SYSTEM message
@@ -1118,38 +1137,48 @@ export const model = {
           },
         });
 
-        const systemData = await new Promise<Record<string, unknown>>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error("WebSocket timeout waiting for SYSTEM message")), 15000);
+        const systemData = await new Promise<Record<string, unknown>>(
+          (resolve, reject) => {
+            const timeout = setTimeout(
+              () =>
+                reject(
+                  new Error("WebSocket timeout waiting for SYSTEM message"),
+                ),
+              15000,
+            );
 
-          ws.onopen = () => {
-            // Connection opened
-          };
+            ws.onopen = () => {
+              // Connection opened
+            };
 
-          ws.onmessage = (event) => {
-            try {
-              const msg = JSON.parse(event.data as string);
-              if (msg.type === "SYSTEM") {
-                clearTimeout(timeout);
-                ws.close();
-                resolve(msg);
+            ws.onmessage = (event) => {
+              try {
+                const msg = JSON.parse(event.data as string);
+                if (msg.type === "SYSTEM") {
+                  clearTimeout(timeout);
+                  ws.close();
+                  resolve(msg);
+                }
+              } catch {
+                // Ignore parse errors from non-JSON messages
               }
-            } catch (e) {
-              // Ignore parse errors from non-JSON messages
-            }
-          };
+            };
 
-          ws.onerror = (err) => {
-            clearTimeout(timeout);
-            reject(new Error(`WebSocket error: ${err}`));
-          };
+            ws.onerror = (err) => {
+              clearTimeout(timeout);
+              reject(new Error(`WebSocket error: ${err}`));
+            };
 
-          ws.onclose = () => {
-            // Connection closed
-          };
-        });
+            ws.onclose = () => {
+              // Connection closed
+            };
+          },
+        );
 
         // Step 4: Parse the SYSTEM message
-        const { os, controllers: controllerUpdates } = mapSystemMessage(systemData);
+        const { os, controllers: controllerUpdates } = mapSystemMessage(
+          systemData,
+        );
 
         const handle = await context.writeResource("consoleUpdates", host, {
           scannedAt: new Date().toISOString(),
